@@ -63,30 +63,57 @@ def badge(label, ok, real_text="실제", dummy_text="더미"):
 DATE_START, DATE_END = "2023-01-01", "2025-12-31"
 WEEKLY_DATES = pd.date_range(DATE_START, DATE_END, freq="W-THU")
 
-# ─── KOSPI200 일별 실데이터 (VKOSPI 프록시·만기일효과·백테스팅의 공통 기반) ─────
+def _yf_download_batch(tickers, start, end, retries=2, delay=2.0):
+    """
+    yfinance 다운로드 재시도 래퍼. Streamlit Cloud처럼 여러 사용자가 IP를 공유하는
+    환경에서는 Yahoo Finance가 개별 요청을 더 쉽게 레이트리밋하므로, 티커를 최대한
+    묶어서 한 번에 요청하고(batch) 실패 시 잠깐 쉬었다 재시도합니다.
+    """
+    import time
+    import yfinance as yf
+    last_err = None
+    for attempt in range(retries):
+        try:
+            df = yf.download(tickers, start=start, end=end, progress=False, threads=False)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            last_err = e
+        if attempt < retries - 1:
+            time.sleep(delay)
+    if last_err:
+        print(f"[yfinance 배치 다운로드 실패: {tickers}] {last_err}")
+    return None
+
+# ─── 핵심 시장지수 일별 실데이터 (KOSPI200·VIX·VHSI를 한 번에 배치 요청) ─────
 @st.cache_data(ttl=3600)
+def load_core_market_data():
+    """
+    ^KS200(코스피200)·^VIX·^VHSI를 하나의 요청으로 배치 로드합니다.
+    ^KS200 시계열은 ① VKOSPI 실현변동성 프록시, ② 만기일 효과 t검정, ③ 백테스팅
+    세 곳의 공통 원자료입니다. 실패 시 해당 지표만 동일하게 더미로 폴백합니다.
+    """
+    result = {"ks200": None, "ks200_ok": False, "vix": None, "vix_ok": False, "vhsi": None, "vhsi_ok": False}
+    raw = _yf_download_batch(["^KS200", "^VIX", "^VHSI"], "2022-11-01", DATE_END)
+    if raw is None or "Close" not in raw.columns.get_level_values(0):
+        return result
+    close = raw["Close"]
+    if isinstance(close, pd.Series):
+        close = close.to_frame(name="^KS200")
+    for ticker, key, min_len in [("^KS200", "ks200", 100), ("^VIX", "vix", 20), ("^VHSI", "vhsi", 20)]:
+        if ticker in close.columns:
+            s = close[ticker].dropna()
+            if len(s) >= min_len:
+                result[key] = s
+                result[f"{key}_ok"] = True
+    return result
+
 def load_kospi200_daily():
-    """
-    yfinance ^KS200(코스피200) 일별 종가를 로드합니다.
-    이 시계열이 ① VKOSPI 실현변동성 프록시, ② 만기일 효과 t검정, ③ 백테스팅
-    세 곳의 공통 원자료입니다. 실패 시 세 곳 모두 동일하게 더미로 폴백합니다.
-    """
-    try:
-        import yfinance as yf
-        raw = yf.download("^KS200", start="2022-11-01", end=DATE_END, progress=False)
-        if raw is None or raw.empty:
-            raise ValueError("빈 데이터프레임")
-        close = raw["Close"]
-        if isinstance(close, pd.DataFrame):
-            close = close.iloc[:, 0]
-        close = close.dropna()
-        if len(close) < 100:
-            raise ValueError(f"데이터 부족 ({len(close)}행)")
-        daily = pd.DataFrame({"close": close})
-        return daily, True
-    except Exception as e:
-        print(f"[KOSPI200 일별 데이터 로드 실패] {e}")
-        return pd.DataFrame(columns=["close"]), False
+    """load_core_market_data()의 KOSPI200 부분을 daily/daily_ok 형태로 반환 (하위 호환용)."""
+    core = load_core_market_data()
+    if core["ks200_ok"]:
+        return pd.DataFrame({"close": core["ks200"]}), True
+    return pd.DataFrame(columns=["close"]), False
 
 def compute_vkospi_proxy(daily, daily_ok):
     """
@@ -122,37 +149,24 @@ def compute_weekly_returns(daily, daily_ok):
 def load_market_indices():
     dates = WEEKLY_DATES
     n = len(dates)
-    daily, daily_ok = load_kospi200_daily()
+    core = load_core_market_data()
+    daily, daily_ok = (pd.DataFrame({"close": core["ks200"]}), True) if core["ks200_ok"] \
+        else (pd.DataFrame(columns=["close"]), False)
     vkospi, vkospi_real = compute_vkospi_proxy(daily, daily_ok)
-
-    yf_series, yf_ok = {}, {"vhsi": False, "vix": False}
-    try:
-        import yfinance as yf
-        for key, ticker in {"vhsi": "^VHSI", "vix": "^VIX"}.items():
-            df_raw = yf.download(ticker, start="2023-01-01", end=DATE_END, progress=False)
-            if df_raw is None or df_raw.empty:
-                continue
-            close = df_raw["Close"]
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-            reind = close.resample("W-THU").last().reindex(dates, method="ffill")
-            if reind.notna().sum() > 10:
-                yf_series[key] = reind.values
-                yf_ok[key] = True
-    except Exception as e:
-        print(f"[VHSI/VIX 로드 실패] {e}")
 
     df_out = pd.DataFrame({"date": dates, "vkospi": vkospi})
 
-    if "vhsi" in yf_series:
-        df_out["vhsi"] = yf_series["vhsi"]
-    else:
+    yf_ok = {"vhsi": False, "vix": False}
+    for key in ("vhsi", "vix"):
+        if core[f"{key}_ok"]:
+            reind = core[key].resample("W-THU").last().reindex(dates, method="ffill")
+            if reind.notna().sum() > 10:
+                df_out[key] = reind.values
+                yf_ok[key] = True
+    if "vhsi" not in df_out.columns:
         np.random.seed(10)
         df_out["vhsi"] = np.clip(22 + np.cumsum(np.random.randn(n) * 0.85) + np.sin(np.arange(n) * 0.25) * 5, 8, 55)
-
-    if "vix" in yf_series:
-        df_out["vix"] = yf_series["vix"]
-    else:
+    if "vix" not in df_out.columns:
         np.random.seed(50)
         df_out["vix"] = np.clip(20 + np.cumsum(np.random.randn(n) * 0.85) + np.sin(np.arange(n) * 0.25) * 5, 8, 55)
 
@@ -343,23 +357,19 @@ def run_backtest(weekly_close, weekly_ret, weekly_ok, pred_df):
 def load_covered_call_data():
     """커버드콜 ETF 실제 데이터 로드 — KR 티커 우선, 실패시 US 티커, 그마저 실패시 더미"""
     dates = pd.date_range("2023-01-01", "2025-12-31", freq="W-THU")
-    try:
-        import yfinance as yf
-        candidates = [
-            ("279530.KS", "TIGER 200커버드콜ATM (KR)"),
-            ("QYLD", "Global X NASDAQ 100 Covered Call (US)"),
-        ]
-        for ticker, label in candidates:
-            d = yf.download(ticker, start="2023-01-01", end="2025-12-31", progress=False)
-            if not d.empty:
-                s = d["Close"].resample("W-THU").last().reindex(dates, method="ffill")
-                if isinstance(s, pd.DataFrame):
-                    s = s.iloc[:, 0]
-                df_out = pd.DataFrame({"date": dates, "covered_call": s.values})
-                if df_out["covered_call"].notna().sum() > 10:
-                    return df_out, True, label
-    except Exception:
-        pass
+    candidates = [
+        ("279530.KS", "TIGER 200커버드콜ATM (KR)"),
+        ("QYLD", "Global X NASDAQ 100 Covered Call (US)"),
+    ]
+    for ticker, label in candidates:
+        d = _yf_download_batch(ticker, "2023-01-01", "2025-12-31")
+        if d is not None and not d.empty:
+            s = d["Close"].resample("W-THU").last().reindex(dates, method="ffill")
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            df_out = pd.DataFrame({"date": dates, "covered_call": s.values})
+            if df_out["covered_call"].notna().sum() > 10:
+                return df_out, True, label
     np.random.seed(77)
     n = len(dates)
     cc = 100 + np.cumsum(np.random.randn(n)*0.5) - np.sin(np.arange(n)*0.3)*3
@@ -391,21 +401,14 @@ def load_fear_greed_data():
 @st.cache_data(ttl=3600)
 def load_macro_data():
     dates = pd.date_range("2023-01-01", "2025-12-31", freq="W-THU")
-    try:
-        import yfinance as yf
-        fx = yf.download("USDKRW=X", start="2023-01-01", end="2025-12-31", progress=False)
-        rate = yf.download("^TNX", start="2023-01-01", end="2025-12-31", progress=False)
-        if not fx.empty and not rate.empty:
-            fx_s = fx["Close"].resample("W-THU").last().reindex(dates, method="ffill")
-            rate_s = rate["Close"].resample("W-THU").last().reindex(dates, method="ffill")
-            if isinstance(fx_s, pd.DataFrame):
-                fx_s = fx_s.iloc[:, 0]
-            if isinstance(rate_s, pd.DataFrame):
-                rate_s = rate_s.iloc[:, 0]
+    raw = _yf_download_batch(["USDKRW=X", "^TNX"], "2023-01-01", "2025-12-31")
+    if raw is not None and "Close" in raw.columns.get_level_values(0):
+        close = raw["Close"]
+        if "USDKRW=X" in close.columns and "^TNX" in close.columns:
+            fx_s = close["USDKRW=X"].resample("W-THU").last().reindex(dates, method="ffill")
+            rate_s = close["^TNX"].resample("W-THU").last().reindex(dates, method="ffill")
             if fx_s.notna().sum() > 10 and rate_s.notna().sum() > 10:
                 return pd.DataFrame({"date": dates, "usdkrw": fx_s.values, "us10y": rate_s.values}), True
-    except Exception:
-        pass
     np.random.seed(66)
     n = len(dates)
     fx = 1300 + np.cumsum(np.random.randn(n)*5)
@@ -651,11 +654,13 @@ with tab2:
     rows.append({"모델":"TabNet (미구현·향후 과제)","정밀도":np.nan,"재현율":np.nan,"F1-Score":np.nan,"AUC":np.nan})
     perf_df = pd.DataFrame(rows)
     st.markdown("<div class='section-header'>모델 성능 비교</div>",unsafe_allow_html=True)
-    st.dataframe(
-        perf_df.style
-        .background_gradient(subset=["AUC"],cmap="Blues")
-        .format({"정밀도":"{:.2f}","재현율":"{:.2f}","F1-Score":"{:.2f}","AUC":"{:.2f}"}, na_rep="—"),
-        use_container_width=True,hide_index=True)
+    # st.dataframe은 NaN 셀을 Styler의 표시값과 무관하게 항상 "None"으로 렌더링하므로
+    # (프론트엔드 그리드가 표시 텍스트보다 원본 null 여부를 우선함), Styler 대신
+    # 미리 문자열로 포맷한 DataFrame을 직접 표시합니다.
+    perf_display = perf_df.copy()
+    for col in ["정밀도","재현율","F1-Score","AUC"]:
+        perf_display[col] = perf_df[col].apply(lambda v: "—" if pd.isna(v) else f"{v:.2f}")
+    st.dataframe(perf_display, use_container_width=True, hide_index=True)
     if ml_results and ml_results.get("xgb"):
         st.caption(f"✅ TimeSeriesSplit(5-fold) Out-of-Fold 예측 기준 실측값 (검증표본 n={ml_results['xgb']['n_valid']}/전체 "
                    f"{len(build_features(df))}). 각 fold의 테스트 구간 예측만 모아 계산해 데이터 누수를 방지했습니다.")
