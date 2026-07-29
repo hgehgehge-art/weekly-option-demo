@@ -15,6 +15,12 @@ try:
 except ImportError:
     XGBOOST_AVAILABLE = False
 
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+
 # ─── 페이지 설정 ───────────────────────────────────────────────
 st.set_page_config(
     page_title="위클리 옵션 변동성 예측 대시보드",
@@ -261,6 +267,77 @@ def train_predict_models(df):
     error = None if results.get("xgb") else "XGBoost OOF 예측 표본이 부족합니다"
     return df_merged, results, error
 
+FEATURE_LABELS = {
+    "vkospi_t": "VKOSPI(당주, 실현변동성)",
+    "vkospi_lag1": "VKOSPI(전주)",
+    "vkospi_ma4": "VKOSPI 4주 이동평균",
+    "vix_t": "VIX(당주)",
+    "vhsi_t": "VHSI(당주)",
+    "pcr_t": "PCR(당주, 시뮬레이션)",
+    "oi_change_t": "미결제약정 변화율(당주, 시뮬레이션)",
+}
+
+@st.cache_data
+def compute_shap_importance(df):
+    """
+    위 OOF 성능 지표와는 별개로, 전체 데이터로 재학습한 최종 XGBoost 모델에
+    SHAP(TreeExplainer)을 적용해 어떤 변수가 '다음 주 고변동성' 예측에 가장
+    크게 기여했는지 계산합니다. (기획서의 XAI 계층을 겨냥한 최소 구현)
+    """
+    if not (SHAP_AVAILABLE and XGBOOST_AVAILABLE):
+        return None, "SHAP 또는 XGBoost가 설치되지 않아 계산할 수 없습니다"
+    feat = build_features(df)
+    if len(feat) < 30:
+        return None, f"학습 가능한 표본이 부족합니다 (n={len(feat)})"
+    X = feat.drop(columns=["date", "target"])
+    y = feat["target"].astype(int)
+    if y.nunique() < 2:
+        return None, "target(다음주 고변동성)이 단일 클래스라 계산할 수 없습니다"
+
+    model = XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.08,
+                           eval_metric="logloss", random_state=42)
+    model.fit(X, y)
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+    if isinstance(shap_values, list):
+        shap_values = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+    shap_values = np.asarray(shap_values)
+    if shap_values.ndim == 3:
+        shap_values = shap_values[:, :, 1]
+
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    shap_df = pd.DataFrame({
+        "변수": [FEATURE_LABELS.get(c, c) for c in X.columns],
+        "평균 |SHAP| 영향도": mean_abs,
+    }).sort_values("평균 |SHAP| 영향도", ascending=True).reset_index(drop=True)
+    return shap_df, None
+
+# ─── Isolation Forest 이상탐지 — 축소판 ──────────────────────────
+ANOMALY_FEATURES = ["vkospi", "vix", "vhsi", "pcr", "oi_change"]
+
+@st.cache_data
+def compute_anomaly_scores(df):
+    """
+    ⚠️ 축소판: 기획서 원안은 홍콩·대만·미국의 개별주식 위클리옵션 '도입 전후' 실제
+    옵션 미시구조 데이터(내재변동성·PCR·미결제약정·감마·호가스프레드)를 국가별로 학습해
+    비교하는 방식입니다. 그 데이터는 무료 API로 구할 수 없어, 이 함수는 대신 이
+    대시보드가 이미 가진 국내 지표로 이상탐지 기법 자체만 보여주는 축소판입니다 —
+    실제 '도입 전후 비교' 검증이 아닙니다.
+    """
+    from sklearn.ensemble import IsolationForest
+    from sklearn.preprocessing import StandardScaler
+
+    cols = [c for c in ANOMALY_FEATURES if c in df.columns]
+    X = df[cols].dropna()
+    if len(X) < 30:
+        return None, f"표본이 부족합니다 (n={len(X)})"
+    X_scaled = StandardScaler().fit_transform(X)
+    model = IsolationForest(n_estimators=200, contamination="auto", random_state=42)
+    model.fit(X_scaled)
+    result = df.loc[X.index, ["date"]].copy()
+    result["anomaly_score"] = -model.score_samples(X_scaled)  # 부호 반전 → 높을수록 이상
+    return result, None
+
 # ─── 만기일 효과 t검정 (일별 원자료 기준) ────────────────────────
 @st.cache_data
 def compute_expiry_effect(daily, daily_ok):
@@ -419,6 +496,8 @@ def load_macro_data():
 df, flags, daily, daily_ok = load_market_indices()
 weekly_close, weekly_ret, weekly_ok = compute_weekly_returns(daily, daily_ok)
 df_pred, ml_results, ml_error = train_predict_models(df)
+shap_df, shap_error = compute_shap_importance(df)
+anomaly_df, anomaly_error = compute_anomaly_scores(df)
 bt, bt_stats, bt_real = run_backtest(weekly_close, weekly_ret, weekly_ok, df_pred)
 ed, ed_stats, ed_error = compute_expiry_effect(daily, daily_ok)
 cc_df, cc_real, cc_label = load_covered_call_data()
@@ -511,10 +590,11 @@ for col,label,val,delta in zip(
     </div>""", unsafe_allow_html=True)
 st.markdown("<br>", unsafe_allow_html=True)
 # ─── 탭 ───────────────────────────────────────────────────────
-tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs([
+tab1,tab2,tab3,tab4,tab5,tab6,tab7 = st.tabs([
     "🌏 아시아권 변동성 비교","🤖 모델 예측 결과",
     "⏱ 시간 지평 비교","💰 백테스팅 결과",
-    "🛡️ 커버드콜 헤지효과","😨 공포탐욕지수 국면"
+    "🛡️ 커버드콜 헤지효과","😨 공포탐욕지수 국면",
+    "🔍 이상탐지(축소판)"
 ])
 country_map = {
     "🇭🇰 홍콩 (VHSI)": ("vhsi","#f0b429","VHSI"),
@@ -666,6 +746,23 @@ with tab2:
                    f"{len(build_features(df))}). 각 fold의 테스트 구간 예측만 모아 계산해 데이터 누수를 방지했습니다.")
     if ml_error:
         st.warning(f"⚠️ {ml_error}")
+
+    st.markdown("<div class='section-header'>🔍 SHAP 기반 변수 중요도</div>", unsafe_allow_html=True)
+    if shap_df is not None:
+        fig_shap = go.Figure()
+        fig_shap.add_trace(go.Bar(x=shap_df["평균 |SHAP| 영향도"], y=shap_df["변수"],
+            orientation="h", marker_color="#58a6ff"))
+        fig_shap.update_layout(**{**LAYOUT, "height": 300, "showlegend": False,
+            "xaxis": {**LAYOUT["xaxis"], "title": "평균 |SHAP 값| (다음 주 고변동성 예측 기여도)"},
+            "yaxis": {**LAYOUT["yaxis"]}})
+        st.plotly_chart(fig_shap, use_container_width=True)
+        top_feat = shap_df.iloc[-1]["변수"]
+        st.caption(f"💡 '{top_feat}'가 예측에 가장 크게 기여했습니다. SHAP은 전체 데이터로 재학습한 "
+                   "최종 모델 기준이며, 위 성능 지표(OOF)와는 별개의 모델 적합입니다.")
+        st.caption("⚠️ PCR·미결제약정 변화율은 시뮬레이션 값입니다 — 이 변수가 중요하게 나타나더라도 "
+                   "실제 시장 신호가 아니라 합성 데이터의 인위적 패턴일 수 있으니 해석에 유의하세요.")
+    else:
+        st.warning(f"⚠️ SHAP 계산 불가: {shap_error}")
 # ── Tab 3 ───────────────────────────────────────────────────
 with tab3:
     st.markdown("<div class='section-header'>단기(주간) vs 중장기(월간) 예측력 비교</div>",
@@ -898,8 +995,39 @@ with tab6:
     st.caption("📚 참고: CNN Fear & Greed Index는 미국 시장 기준 지표로, 국내 시장에는 자본시장연구원의 "
                "자본시장 심리지수(CMSI, 노성호 2026 — 국내 증권뉴스를 LLM으로 학습해 구축)가 방법론적으로 "
                "더 적합합니다. CMSI가 공개 데이터로 제공되면 본 지표를 대체할 예정입니다.")
+# ── Tab 7 : Isolation Forest 이상탐지 (축소판) ──────────────────
+with tab7:
+    st.markdown("<div class='section-header'>Isolation Forest 기반 이상탐지 — 축소판</div>", unsafe_allow_html=True)
+    st.caption("📌 기획서 원안은 홍콩·대만·미국의 개별주식 위클리옵션 '도입 전후' 실제 옵션 미시구조 데이터"
+               "(내재변동성·PCR·미결제약정·감마·호가스프레드)를 국가별로 비교하는 방식입니다. 그 데이터는 "
+               "무료 API로 구할 수 없어, 이 탭은 대신 이 대시보드가 이미 가진 국내 지표(VKOSPI 프록시·VIX·VHSI·"
+               "PCR·미결제약정)로 이상탐지 기법 자체를 보여주는 축소판입니다 — 실제 '도입 전후 비교' 검증이 아닙니다.")
+    if anomaly_df is not None:
+        threshold = anomaly_df["anomaly_score"].quantile(0.9)
+        fig_an = go.Figure()
+        fig_an.add_trace(go.Scatter(x=anomaly_df["date"], y=anomaly_df["anomaly_score"],
+            name="이상점수", line=dict(color="#bc8cff", width=2),
+            fill="tozeroy", fillcolor="rgba(188,140,255,0.08)"))
+        fig_an.add_hline(y=threshold, line_dash="dash", line_color="#f85149", opacity=0.6,
+            annotation_text="상위 10% 임계값")
+        fig_an.update_layout(**{**LAYOUT, "height": 320,
+            "yaxis": {**LAYOUT["yaxis"], "title": "이상점수 (높을수록 이상)"}})
+        st.plotly_chart(fig_an, use_container_width=True)
+
+        top5 = anomaly_df.nlargest(5, "anomaly_score")[["date", "anomaly_score"]].copy()
+        top5["date"] = top5["date"].dt.strftime("%Y-%m-%d")
+        top5["anomaly_score"] = top5["anomaly_score"].round(3)
+        st.markdown("<div class='section-header'>이상점수 상위 5개 주</div>", unsafe_allow_html=True)
+        st.dataframe(top5.rename(columns={"date": "주(목요일 기준)", "anomaly_score": "이상점수"}),
+            use_container_width=True, hide_index=True)
+        st.caption("💡 이 주들은 VKOSPI(실현변동성 프록시)·VIX·VHSI·PCR·미결제약정 조합이 평소와 가장 다르게 "
+                   "나타난 구간입니다. PCR·미결제약정이 시뮬레이션 값이라 이상점수 자체도 참고용입니다.")
+    else:
+        st.warning(f"⚠️ 이상탐지 계산 불가: {anomaly_error}")
 st.markdown("---")
 st.caption("⚠️ 본 대시보드는 공모전 시연용 프로토타입입니다.")
-st.caption("📁 데이터 출처: KOSPI200(^KS200)·VIX·VHSI (Yahoo Finance) · CNN Fear & Greed Index | 모델: XGBoost(실측) · Logistic(기준모델, 실측) · TabNet(미구현)")
+st.caption("📁 데이터 출처: KOSPI200(^KS200)·VIX·VHSI (Yahoo Finance) · CNN Fear & Greed Index | "
+           "모델: XGBoost(실측) · Logistic(기준모델, 실측) · TabNet(미구현) · SHAP(실측, XAI) · "
+           "Isolation Forest(실측, 이상탐지 축소판)")
 st.caption("📚 참고문헌: 강태훈(2022) 「변동성지수의 개선을 위한 위클리옵션의 활용에 관한 연구」 한국증권학회지 51(6) · "
            "노성호(2026) 「자본시장 심리지수의 구축과 활용」 자본시장연구원 이슈보고서 26-01")

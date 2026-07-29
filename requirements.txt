@@ -7,3 +7,4 @@ scikit-learn
 xgboost
 scipy
 requests
+shap
